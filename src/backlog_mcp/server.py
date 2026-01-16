@@ -21,8 +21,8 @@ import json
 import logging
 import os
 from typing import Any
-from urllib.request import Request, urlopen
 from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from mcp.server.fastmcp import FastMCP
 
@@ -84,11 +84,12 @@ def _convex_request(
             result = json.loads(response.read().decode("utf-8"))
 
             if "value" in result:
-                return result["value"]
+                value = result["value"]
+                return dict(value) if isinstance(value, dict) else value
             elif "errorMessage" in result:
                 raise ValueError(result["errorMessage"])
             else:
-                return result
+                return dict(result)
 
     except URLError as e:
         raise ConnectionError(
@@ -493,7 +494,7 @@ def get_backlog_summary(project: str | None = None) -> dict[str, Any]:
         return {"error": str(e)}
 
 
-def main():
+def main() -> None:
     """Entry point for the Backlog MCP server."""
     logger.info(f"Starting Backlog MCP server, Convex URL: {CONVEX_URL}")
     mcp.run()
