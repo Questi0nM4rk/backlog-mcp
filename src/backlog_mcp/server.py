@@ -789,7 +789,7 @@ def get_backlog_summary(project: str | None = None) -> dict[str, Any]:
 
 def main() -> None:
     """Entry point for the Backlog MCP server."""
-    logger.info(f"Starting Backlog MCP server, database: {DB_PATH}")
+    logger.info("Starting Backlog MCP server, database: %s", DB_PATH)
     mcp.run()
 
 
