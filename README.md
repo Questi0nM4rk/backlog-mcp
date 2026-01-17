@@ -68,7 +68,8 @@ claude mcp add backlog -- python -m backlog_mcp.server
 
 Database: `~/.codeagent/codeagent.db` (libSQL/SQLite)
 
-The database is created automatically on first use.
+This database is shared with other CodeAgent MCPs (reflection-mcp, amem-mcp, codebase-mcp)
+to enable cross-MCP functionality. The database is created automatically on first use.
 
 ## Task Context Fields
 

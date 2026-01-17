@@ -26,6 +26,10 @@ from typing import Any
 import libsql_experimental as libsql  # type: ignore[import-untyped]
 from mcp.server.fastmcp import FastMCP
 
+# Valid values for task_type and status
+VALID_TASK_TYPES = frozenset({"task", "bug", "spike", "epic"})
+VALID_STATUSES = frozenset({"backlog", "ready", "in_progress", "blocked", "done"})
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -149,17 +153,24 @@ def _get_next_task_number(
 
     Uses MAX to find highest existing number, avoiding race conditions
     that COUNT(*) would cause with concurrent inserts.
+
+    Parses numeric suffix after the last hyphen in task_id to handle
+    numbers >= 1000 correctly (not limited to 3-digit extraction).
     """
     cursor = conn.execute(
-        """
-        SELECT MAX(CAST(SUBSTR(task_id, -3) AS INTEGER))
-        FROM tasks
-        WHERE project_id = ? AND type = ?
-        """,
+        "SELECT task_id FROM tasks WHERE project_id = ? AND type = ?",
         (project_id, task_type),
     )
-    row = cursor.fetchone()
-    max_num: int = row[0] if row and row[0] is not None else 0
+    max_num = 0
+    for (task_id,) in cursor.fetchall():
+        # task_id format: PREFIX-TYPE-NNN (e.g., JC-TASK-001, JC-TASK-1234)
+        parts = task_id.rsplit("-", 1)
+        if len(parts) == 2:
+            try:
+                num = int(parts[1])
+                max_num = max(max_num, num)
+            except ValueError:
+                pass
     return max_num + 1
 
 
@@ -441,6 +452,14 @@ def create_task(
     Returns:
         Created task ID and initial status
     """
+    # Validate task_type
+    task_type_lower = task_type.lower()
+    if task_type_lower not in VALID_TASK_TYPES:
+        return {
+            "error": f"Invalid task_type '{task_type}'. "
+            f"Must be one of: {', '.join(sorted(VALID_TASK_TYPES))}"
+        }
+
     try:
         with closing(_get_db()) as conn:
             prefix_upper = project.upper()
@@ -454,10 +473,6 @@ def create_task(
             if not row:
                 return {"error": f"Project '{prefix_upper}' not found"}
             project_id: int = row[0]
-
-            # Generate task ID
-            task_num = _get_next_task_number(conn, project_id, task_type)
-            task_id = f"{prefix_upper}-{task_type.upper()}-{task_num:03d}"
 
             # Determine initial status
             initial_status = "backlog"
@@ -484,42 +499,57 @@ def create_task(
             else:
                 initial_status = "ready"
 
-            cursor = conn.execute(
-                """
-                INSERT INTO tasks (
-                    project_id, task_id, type, name, status, priority,
-                    description, action, files_exclusive, files_readonly,
-                    files_forbidden, verify, done_criteria, depends_on,
-                    parent_id, execution_strategy, checkpoint_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    project_id,
-                    task_id,
-                    task_type,
-                    name,
-                    initial_status,
-                    priority,
-                    description,
-                    action,
-                    _json_dumps(files_exclusive),
-                    _json_dumps(files_readonly),
-                    _json_dumps(files_forbidden),
-                    _json_dumps(verify),
-                    _json_dumps(done_criteria),
-                    _json_dumps(depends_on),
-                    parent_id,
-                    execution_strategy,
-                    checkpoint_type,
-                ),
-            )
-            conn.commit()
+            # Generate task ID and insert with retry for race conditions
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                task_num = _get_next_task_number(conn, project_id, task_type_lower)
+                task_id = f"{prefix_upper}-{task_type_lower.upper()}-{task_num:03d}"
 
-            return {
-                "created": True,
-                "id": task_id,
-                "status": initial_status,
-            }
+                try:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO tasks (
+                            project_id, task_id, type, name, status, priority,
+                            description, action, files_exclusive, files_readonly,
+                            files_forbidden, verify, done_criteria, depends_on,
+                            parent_id, execution_strategy, checkpoint_type
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            task_id,
+                            task_type_lower,
+                            name,
+                            initial_status,
+                            priority,
+                            description,
+                            action,
+                            _json_dumps(files_exclusive),
+                            _json_dumps(files_readonly),
+                            _json_dumps(files_forbidden),
+                            _json_dumps(verify),
+                            _json_dumps(done_criteria),
+                            _json_dumps(depends_on),
+                            parent_id,
+                            execution_strategy,
+                            checkpoint_type,
+                        ),
+                    )
+                    conn.commit()
+
+                    return {
+                        "created": True,
+                        "id": task_id,
+                        "status": initial_status,
+                    }
+                except libsql.IntegrityError:
+                    # Task ID collision from race condition, retry
+                    if attempt == max_attempts - 1:
+                        raise
+                    continue
+
+            # Should not reach here, but handle gracefully
+            return {"error": "Failed to create task after multiple attempts"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -543,6 +573,14 @@ def update_task_status(
     Returns:
         Update confirmation
     """
+    # Validate status
+    if status not in VALID_STATUSES:
+        return {
+            "updated": False,
+            "error": f"Invalid status '{status}'. "
+            f"Must be one of: {', '.join(sorted(VALID_STATUSES))}",
+        }
+
     try:
         with closing(_get_db()) as conn:
             now = datetime.now().isoformat()
