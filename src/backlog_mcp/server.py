@@ -1,7 +1,7 @@
 """
 Backlog MCP Server - Single-Task Loading for Claude Code
 
-Connects to self-hosted Convex backend for task management.
+Uses libSQL for local task storage.
 Core principle: AI sees ONE task at a time to prevent scope creep.
 
 Tools:
@@ -13,25 +13,25 @@ Tools:
 - complete_task: Mark done and unblock dependents
 - get_backlog_summary: Dashboard view
 
-Environment:
-- CONVEX_URL: Convex backend URL (default: http://localhost:3210)
+Database: ~/.codeagent/codeagent.db
 """
 
 import json
 import logging
-import os
+from datetime import datetime
+from pathlib import Path
 from typing import Any
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
+import libsql_experimental as libsql
 from mcp.server.fastmcp import FastMCP
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Convex configuration
-CONVEX_URL = os.environ.get("CONVEX_URL", "http://localhost:3210")
+# Database configuration
+CODEAGENT_DIR = Path.home() / ".codeagent"
+DB_PATH = CODEAGENT_DIR / "codeagent.db"
 
 # Initialize FastMCP server
 mcp = FastMCP(
@@ -45,58 +45,111 @@ This prevents scope creep and ensures focused implementation.""",
 )
 
 
-def _convex_request(
-    function_type: str, function_name: str, args: dict[str, Any]
-) -> dict[str, Any]:
-    """
-    Make a request to Convex backend.
+def _get_db() -> libsql.Connection:
+    """Get database connection, creating schema if needed."""
+    CODEAGENT_DIR.mkdir(parents=True, exist_ok=True)
+    conn = libsql.connect(str(DB_PATH))
+    _init_schema(conn)
+    return conn
 
-    Args:
-        function_type: 'query' or 'mutation'
-        function_name: Function name (e.g., 'listTasks')
-        args: Function arguments
 
-    Returns:
-        Convex response data
+def _init_schema(conn: libsql.Connection) -> None:
+    """Initialize database schema."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            prefix TEXT UNIQUE NOT NULL,
+            description TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
 
-    Raises:
-        ConnectionError: If Convex is not available
-    """
-    url = f"{CONVEX_URL}/api/{function_type}"
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            task_id TEXT UNIQUE NOT NULL,
+            type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT DEFAULT 'backlog',
+            priority INTEGER DEFAULT 3,
+            description TEXT,
+            action TEXT,
+            files_exclusive TEXT,
+            files_readonly TEXT,
+            files_forbidden TEXT,
+            verify TEXT,
+            done_criteria TEXT,
+            depends_on TEXT,
+            parent_id TEXT,
+            execution_strategy TEXT,
+            checkpoint_type TEXT,
+            blocker_reason TEXT,
+            blocker_needs TEXT,
+            summary TEXT,
+            commits TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
 
-    payload = json.dumps(
-        {
-            "path": f"functions:{function_name}",
-            "args": args,
-            "format": "json",
-        }
-    ).encode("utf-8")
+        CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+        CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
+    """)
+    conn.commit()
 
-    req = Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
 
+def _json_loads(val: str | None) -> list[str] | None:
+    """Parse JSON array or return None."""
+    if val is None:
+        return None
     try:
-        with urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        return json.loads(val)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
-            if "value" in result:
-                value = result["value"]
-                return dict(value) if isinstance(value, dict) else value
-            elif "errorMessage" in result:
-                raise ValueError(result["errorMessage"])
-            else:
-                return dict(result)
 
-    except URLError as e:
-        raise ConnectionError(
-            f"backlog-mcp cannot connect to Convex at {CONVEX_URL}\n"
-            f"Run: codeagent start convex\n"
-            f"Error: {e}"
-        ) from e
+def _json_dumps(val: list[str] | None) -> str | None:
+    """Serialize list to JSON or return None."""
+    if val is None:
+        return None
+    return json.dumps(val)
+
+
+def _row_to_task(row: tuple[Any, ...], columns: list[str]) -> dict[str, Any]:
+    """Convert database row to task dict with JSON parsing."""
+    task = dict(zip(columns, row, strict=False))
+
+    # Parse JSON fields
+    json_fields = [
+        "files_exclusive",
+        "files_readonly",
+        "files_forbidden",
+        "verify",
+        "done_criteria",
+        "depends_on",
+        "commits",
+    ]
+    for field in json_fields:
+        if field in task:
+            task[field] = _json_loads(task[field])
+
+    return task
+
+
+def _get_next_task_number(
+    conn: libsql.Connection, project_id: int, task_type: str
+) -> int:
+    """Get the next task number for a project/type combo."""
+    cursor = conn.execute(
+        """
+        SELECT COUNT(*) FROM tasks
+        WHERE project_id = ? AND type = ?
+        """,
+        (project_id, task_type),
+    )
+    count = cursor.fetchone()[0]
+    return count + 1
 
 
 # ============================================
@@ -122,23 +175,26 @@ def create_project(
         Created project with ID and prefix
     """
     try:
-        result = _convex_request(
-            "mutation",
-            "createProject",
-            {
-                "name": name,
-                "prefix": prefix.upper(),
-                "description": description,
-            },
+        conn = _get_db()
+        prefix_upper = prefix.upper()
+
+        cursor = conn.execute(
+            """
+            INSERT INTO projects (name, prefix, description)
+            VALUES (?, ?, ?)
+            """,
+            (name, prefix_upper, description),
         )
+        conn.commit()
+
         return {
             "created": True,
-            "id": result["id"],
-            "prefix": result["prefix"],
+            "id": cursor.lastrowid,
+            "prefix": prefix_upper,
         }
-    except ConnectionError as e:
-        return {"error": str(e)}
-    except ValueError as e:
+    except libsql.IntegrityError:
+        return {"error": f"Project with prefix '{prefix}' already exists"}
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -151,12 +207,18 @@ def list_projects() -> dict[str, Any]:
         List of projects with name and prefix
     """
     try:
-        projects = _convex_request("query", "listProjects", {})
+        conn = _get_db()
+        cursor = conn.execute(
+            "SELECT id, name, prefix, description, created_at FROM projects ORDER BY name"
+        )
+        columns = ["id", "name", "prefix", "description", "created_at"]
+        projects = [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
         return {
             "projects": projects,
             "count": len(projects),
         }
-    except ConnectionError as e:
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -188,22 +250,39 @@ def list_tasks(
         List of task summaries (NOT full context)
     """
     try:
-        args: dict[str, Any] = {"limit": limit}
-        if project:
-            args["project_prefix"] = project.upper()
-        if status:
-            args["status"] = status
-        if task_type:
-            args["type"] = task_type
+        conn = _get_db()
 
-        tasks = _convex_request("query", "listTasks", args)
+        query = """
+            SELECT t.task_id, t.name, t.status, t.priority, t.type, p.prefix
+            FROM tasks t
+            JOIN projects p ON t.project_id = p.id
+            WHERE 1=1
+        """
+        params: list[Any] = []
+
+        if project:
+            query += " AND p.prefix = ?"
+            params.append(project.upper())
+        if status:
+            query += " AND t.status = ?"
+            params.append(status)
+        if task_type:
+            query += " AND t.type = ?"
+            params.append(task_type)
+
+        query += " ORDER BY t.priority ASC, t.created_at ASC LIMIT ?"
+        params.append(limit)
+
+        cursor = conn.execute(query, params)
+        columns = ["task_id", "name", "status", "priority", "type", "project"]
+        tasks = [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
 
         return {
             "tasks": tasks,
             "count": len(tasks),
             "note": "Summaries only. Use get_task(id) for full context.",
         }
-    except ConnectionError as e:
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -225,16 +304,31 @@ def get_task(task_id: str) -> dict[str, Any]:
         Full task context for implementation
     """
     try:
-        task = _convex_request("query", "getTask", {"task_id": task_id})
+        conn = _get_db()
 
-        if not task:
+        cursor = conn.execute(
+            """
+            SELECT t.*, p.prefix, p.name as project_name
+            FROM tasks t
+            JOIN projects p ON t.project_id = p.id
+            WHERE t.task_id = ?
+            """,
+            (task_id,),
+        )
+
+        row = cursor.fetchone()
+        if not row:
             return {"found": False, "error": f"Task '{task_id}' not found"}
+
+        # Get column names from cursor description
+        columns = [desc[0] for desc in cursor.description]
+        task = _row_to_task(row, columns)
 
         return {
             "found": True,
             "task": task,
         }
-    except ConnectionError as e:
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -257,25 +351,42 @@ def get_next_task(
         Full context for the highest-priority ready task
     """
     try:
-        args: dict[str, Any] = {}
+        conn = _get_db()
+
+        query = """
+            SELECT t.*, p.prefix, p.name as project_name
+            FROM tasks t
+            JOIN projects p ON t.project_id = p.id
+            WHERE t.status = 'ready'
+        """
+        params: list[Any] = []
+
         if project:
-            args["project_prefix"] = project.upper()
+            query += " AND p.prefix = ?"
+            params.append(project.upper())
         if task_type:
-            args["type"] = task_type
+            query += " AND t.type = ?"
+            params.append(task_type)
 
-        task = _convex_request("query", "getNextTask", args)
+        query += " ORDER BY t.priority ASC, t.created_at ASC LIMIT 1"
 
-        if not task:
+        cursor = conn.execute(query, params)
+        row = cursor.fetchone()
+
+        if not row:
             return {
                 "found": False,
                 "message": "No ready tasks found",
             }
 
+        columns = [desc[0] for desc in cursor.description]
+        task = _row_to_task(row, columns)
+
         return {
             "found": True,
             "task": task,
         }
-    except ConnectionError as e:
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -321,45 +432,78 @@ def create_task(
         Created task ID and initial status
     """
     try:
-        args: dict[str, Any] = {
-            "project_prefix": project.upper(),
-            "type": task_type,
-            "name": name,
-            "action": action,
-            "priority": priority,
-        }
+        conn = _get_db()
+        prefix_upper = project.upper()
 
-        if description:
-            args["description"] = description
-        if files_exclusive:
-            args["files_exclusive"] = files_exclusive
-        if files_readonly:
-            args["files_readonly"] = files_readonly
-        if files_forbidden:
-            args["files_forbidden"] = files_forbidden
-        if verify:
-            args["verify"] = verify
-        if done_criteria:
-            args["done_criteria"] = done_criteria
+        # Get project ID
+        cursor = conn.execute(
+            "SELECT id FROM projects WHERE prefix = ?",
+            (prefix_upper,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {"error": f"Project '{prefix_upper}' not found"}
+        project_id = row[0]
+
+        # Generate task ID
+        task_num = _get_next_task_number(conn, project_id, task_type)
+        task_id = f"{prefix_upper}-{task_type.upper()}-{task_num:03d}"
+
+        # Determine initial status
+        initial_status = "backlog"
         if depends_on:
-            args["depends_on"] = depends_on
-        if parent_id:
-            args["parent_id"] = parent_id
-        if execution_strategy:
-            args["execution_strategy"] = execution_strategy
-        if checkpoint_type:
-            args["checkpoint_type"] = checkpoint_type
+            # Check if all dependencies are done
+            placeholders = ",".join("?" * len(depends_on))
+            cursor = conn.execute(
+                f"""
+                SELECT COUNT(*) FROM tasks
+                WHERE task_id IN ({placeholders}) AND status != 'done'
+                """,
+                depends_on,
+            )
+            incomplete = cursor.fetchone()[0]
+            if incomplete == 0:
+                initial_status = "ready"
+        else:
+            initial_status = "ready"
 
-        result = _convex_request("mutation", "createTask", args)
+        cursor = conn.execute(
+            """
+            INSERT INTO tasks (
+                project_id, task_id, type, name, status, priority,
+                description, action, files_exclusive, files_readonly,
+                files_forbidden, verify, done_criteria, depends_on,
+                parent_id, execution_strategy, checkpoint_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                task_id,
+                task_type,
+                name,
+                initial_status,
+                priority,
+                description,
+                action,
+                _json_dumps(files_exclusive),
+                _json_dumps(files_readonly),
+                _json_dumps(files_forbidden),
+                _json_dumps(verify),
+                _json_dumps(done_criteria),
+                _json_dumps(depends_on),
+                parent_id,
+                execution_strategy,
+                checkpoint_type,
+            ),
+        )
+        conn.commit()
 
         return {
             "created": True,
-            "id": result["id"],
-            "status": result["status"],
+            "id": task_id,
+            "status": initial_status,
         }
-    except ConnectionError as e:
-        return {"error": str(e)}
-    except ValueError as e:
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -383,23 +527,38 @@ def update_task_status(
         Update confirmation
     """
     try:
-        args: dict[str, Any] = {
-            "task_id": task_id,
-            "status": status,
-        }
+        conn = _get_db()
+
+        now = datetime.now().isoformat()
 
         if status == "blocked":
-            if blocker_reason:
-                args["blocker_reason"] = blocker_reason
-            if blocker_needs:
-                args["blocker_needs"] = blocker_needs
+            conn.execute(
+                """
+                UPDATE tasks SET
+                    status = ?, blocker_reason = ?, blocker_needs = ?,
+                    updated_at = ?
+                WHERE task_id = ?
+                """,
+                (status, blocker_reason, blocker_needs, now, task_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE tasks SET
+                    status = ?, blocker_reason = NULL, blocker_needs = NULL,
+                    updated_at = ?
+                WHERE task_id = ?
+                """,
+                (status, now, task_id),
+            )
+        conn.commit()
 
-        result = _convex_request("mutation", "updateTaskStatus", args)
-
-        return result
-    except ConnectionError as e:
-        return {"error": str(e)}
-    except ValueError as e:
+        return {
+            "updated": True,
+            "id": task_id,
+            "status": status,
+        }
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -421,23 +580,64 @@ def complete_task(
         Completion status and list of unblocked tasks
     """
     try:
-        args: dict[str, Any] = {"task_id": task_id}
+        conn = _get_db()
+        now = datetime.now().isoformat()
 
-        if summary:
-            args["summary"] = summary
-        if commits:
-            args["commits"] = commits
+        # Update the task
+        conn.execute(
+            """
+            UPDATE tasks SET
+                status = 'done', summary = ?, commits = ?, updated_at = ?
+            WHERE task_id = ?
+            """,
+            (summary, _json_dumps(commits), now, task_id),
+        )
 
-        result = _convex_request("mutation", "completeTask", args)
+        # Find and unblock dependent tasks
+        cursor = conn.execute(
+            """
+            SELECT task_id, depends_on FROM tasks
+            WHERE depends_on LIKE ? AND status = 'backlog'
+            """,
+            (f'%"{task_id}"%',),
+        )
+
+        unblocked = []
+        for row in cursor.fetchall():
+            dep_task_id, depends_on_json = row
+            depends_on = _json_loads(depends_on_json) or []
+
+            if task_id in depends_on:
+                # Check if all dependencies are now done
+                remaining = [d for d in depends_on if d != task_id]
+                if remaining:
+                    placeholders = ",".join("?" * len(remaining))
+                    check = conn.execute(
+                        f"""
+                        SELECT COUNT(*) FROM tasks
+                        WHERE task_id IN ({placeholders}) AND status != 'done'
+                        """,
+                        remaining,
+                    )
+                    incomplete = check.fetchone()[0]
+                else:
+                    incomplete = 0
+
+                if incomplete == 0:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready', updated_at = ? WHERE task_id = ?",
+                        (now, dep_task_id),
+                    )
+                    unblocked.append(dep_task_id)
+
+        conn.commit()
 
         return {
             "completed": True,
-            "id": result["id"],
-            "unblocked": result.get("unblocked", []),
+            "id": task_id,
+            "unblocked": unblocked,
         }
-    except ConnectionError as e:
-        return {"error": str(e)}
-    except ValueError as e:
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -453,11 +653,18 @@ def delete_task(task_id: str) -> dict[str, Any]:
         Deletion confirmation
     """
     try:
-        result = _convex_request("mutation", "deleteTask", {"task_id": task_id})
-        return result
-    except ConnectionError as e:
-        return {"error": str(e)}
-    except ValueError as e:
+        conn = _get_db()
+        cursor = conn.execute(
+            "DELETE FROM tasks WHERE task_id = ?",
+            (task_id,),
+        )
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            return {"deleted": False, "error": f"Task '{task_id}' not found"}
+
+        return {"deleted": True, "id": task_id}
+    except Exception as e:
         return {"error": str(e)}
 
 
@@ -480,23 +687,86 @@ def get_backlog_summary(project: str | None = None) -> dict[str, Any]:
         Summary with counts and highlighted items
     """
     try:
-        args: dict[str, Any] = {}
-        if project:
-            args["project_prefix"] = project.upper()
+        conn = _get_db()
 
-        summary = _convex_request("query", "getBacklogSummary", args)
+        # Build base query conditions
+        base_condition = ""
+        params: list[Any] = []
+        if project:
+            base_condition = "WHERE p.prefix = ?"
+            params = [project.upper()]
+
+        # Count by status
+        cursor = conn.execute(
+            f"""
+            SELECT t.status, COUNT(*) FROM tasks t
+            JOIN projects p ON t.project_id = p.id
+            {base_condition}
+            GROUP BY t.status
+            """,
+            params,
+        )
+        by_status = dict(cursor.fetchall())
+
+        # Count by type
+        cursor = conn.execute(
+            f"""
+            SELECT t.type, COUNT(*) FROM tasks t
+            JOIN projects p ON t.project_id = p.id
+            {base_condition}
+            GROUP BY t.type
+            """,
+            params,
+        )
+        by_type = dict(cursor.fetchall())
+
+        # Get in-progress tasks
+        cursor = conn.execute(
+            f"""
+            SELECT t.task_id, t.name, t.priority FROM tasks t
+            JOIN projects p ON t.project_id = p.id
+            WHERE t.status = 'in_progress'
+            {"AND p.prefix = ?" if project else ""}
+            ORDER BY t.priority ASC
+            """,
+            params,
+        )
+        in_progress = [
+            {"task_id": row[0], "name": row[1], "priority": row[2]}
+            for row in cursor.fetchall()
+        ]
+
+        # Get blocked tasks
+        cursor = conn.execute(
+            f"""
+            SELECT t.task_id, t.name, t.blocker_reason FROM tasks t
+            JOIN projects p ON t.project_id = p.id
+            WHERE t.status = 'blocked'
+            {"AND p.prefix = ?" if project else ""}
+            """,
+            params,
+        )
+        blocked = [
+            {"task_id": row[0], "name": row[1], "reason": row[2]}
+            for row in cursor.fetchall()
+        ]
 
         return {
-            "summary": summary,
-            "dashboard_url": "http://localhost:6791",
+            "summary": {
+                "by_status": by_status,
+                "by_type": by_type,
+                "in_progress": in_progress,
+                "blocked": blocked,
+                "total": sum(by_status.values()),
+            },
         }
-    except ConnectionError as e:
+    except Exception as e:
         return {"error": str(e)}
 
 
 def main() -> None:
     """Entry point for the Backlog MCP server."""
-    logger.info(f"Starting Backlog MCP server, Convex URL: {CONVEX_URL}")
+    logger.info(f"Starting Backlog MCP server, database: {DB_PATH}")
     mcp.run()
 
 
