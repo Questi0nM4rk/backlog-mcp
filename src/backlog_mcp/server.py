@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import libsql_experimental as libsql
+import libsql_experimental as libsql  # type: ignore[import-untyped]
 from mcp.server.fastmcp import FastMCP
 
 # Configure logging
@@ -55,6 +55,7 @@ def _get_db() -> libsql.Connection:
 
 def _init_schema(conn: libsql.Connection) -> None:
     """Initialize database schema."""
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,7 +105,10 @@ def _json_loads(val: str | None) -> list[str] | None:
     if val is None:
         return None
     try:
-        return json.loads(val)
+        result = json.loads(val)
+        if isinstance(result, list):
+            return result
+        return None
     except (json.JSONDecodeError, TypeError):
         return None
 
@@ -148,7 +152,8 @@ def _get_next_task_number(
         """,
         (project_id, task_type),
     )
-    count = cursor.fetchone()[0]
+    row = cursor.fetchone()
+    count: int = row[0] if row else 0
     return count + 1
 
 
@@ -532,7 +537,7 @@ def update_task_status(
         now = datetime.now().isoformat()
 
         if status == "blocked":
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE tasks SET
                     status = ?, blocker_reason = ?, blocker_needs = ?,
@@ -542,7 +547,7 @@ def update_task_status(
                 (status, blocker_reason, blocker_needs, now, task_id),
             )
         else:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE tasks SET
                     status = ?, blocker_reason = NULL, blocker_needs = NULL,
@@ -551,6 +556,10 @@ def update_task_status(
                 """,
                 (status, now, task_id),
             )
+
+        if cursor.rowcount == 0:
+            return {"updated": False, "error": f"Task '{task_id}' not found"}
+
         conn.commit()
 
         return {
