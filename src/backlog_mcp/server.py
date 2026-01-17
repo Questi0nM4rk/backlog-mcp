@@ -145,17 +145,22 @@ def _row_to_task(row: tuple[Any, ...], columns: list[str]) -> dict[str, Any]:
 def _get_next_task_number(
     conn: libsql.Connection, project_id: int, task_type: str
 ) -> int:
-    """Get the next task number for a project/type combo."""
+    """Get the next task number for a project/type combo.
+
+    Uses MAX to find highest existing number, avoiding race conditions
+    that COUNT(*) would cause with concurrent inserts.
+    """
     cursor = conn.execute(
         """
-        SELECT COUNT(*) FROM tasks
+        SELECT MAX(CAST(SUBSTR(task_id, -3) AS INTEGER))
+        FROM tasks
         WHERE project_id = ? AND type = ?
         """,
         (project_id, task_type),
     )
     row = cursor.fetchone()
-    count: int = row[0] if row else 0
-    return count + 1
+    max_num: int = row[0] if row and row[0] is not None else 0
+    return max_num + 1
 
 
 # ============================================

@@ -8,8 +8,17 @@ Single-task loading MCP server for Claude Code - prevents scope creep by exposin
 |------|---------|
 | `src/backlog_mcp/server.py` | Main MCP server with all tools |
 | `src/backlog_mcp/__init__.py` | Package exports |
-| `convex/` | Convex backend functions |
 | `pyproject.toml` | Dependencies and build config |
+
+## Prerequisites
+
+Install uv (fast Python package manager):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+After installation, ensure `uv` is on your PATH (restart shell or source the profile).
 
 ## Commands
 
@@ -26,10 +35,13 @@ uv run ruff format .
 # Type check
 uv run mypy src/
 
-# Run server (requires Convex backend)
-CONVEX_URL=http://localhost:3210 uv run backlog-mcp
+# Run tests
+uv run pytest tests/ -v
+
+# Run server (uses local libSQL database)
+uv run backlog-mcp
 ```
 
-## Environment
+## Storage
 
-- `CONVEX_URL`: Backend URL (default: `http://localhost:3210`)
+Database: `~/.codeagent/codeagent.db` (libSQL/SQLite)
