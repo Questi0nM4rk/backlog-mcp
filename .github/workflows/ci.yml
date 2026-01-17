@@ -30,7 +30,7 @@ jobs:
         run: ruff format --check src/ tests/
 
       - name: Type check with mypy
-        run: mypy src/ --strict
+        run: mypy src/ tests/ --strict
 
   test:
     runs-on: ubuntu-latest
