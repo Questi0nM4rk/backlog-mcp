@@ -18,6 +18,7 @@ Database: ~/.codeagent/codeagent.db
 
 import json
 import logging
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -180,23 +181,23 @@ def create_project(
         Created project with ID and prefix
     """
     try:
-        conn = _get_db()
-        prefix_upper = prefix.upper()
+        with closing(_get_db()) as conn:
+            prefix_upper = prefix.upper()
 
-        cursor = conn.execute(
-            """
-            INSERT INTO projects (name, prefix, description)
-            VALUES (?, ?, ?)
-            """,
-            (name, prefix_upper, description),
-        )
-        conn.commit()
+            cursor = conn.execute(
+                """
+                INSERT INTO projects (name, prefix, description)
+                VALUES (?, ?, ?)
+                """,
+                (name, prefix_upper, description),
+            )
+            conn.commit()
 
-        return {
-            "created": True,
-            "id": cursor.lastrowid,
-            "prefix": prefix_upper,
-        }
+            return {
+                "created": True,
+                "id": cursor.lastrowid,
+                "prefix": prefix_upper,
+            }
     except libsql.IntegrityError:
         return {"error": f"Project with prefix '{prefix}' already exists"}
     except Exception as e:
@@ -212,17 +213,19 @@ def list_projects() -> dict[str, Any]:
         List of projects with name and prefix
     """
     try:
-        conn = _get_db()
-        cursor = conn.execute(
-            "SELECT id, name, prefix, description, created_at FROM projects ORDER BY name"
-        )
-        columns = ["id", "name", "prefix", "description", "created_at"]
-        projects = [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+        with closing(_get_db()) as conn:
+            cursor = conn.execute(
+                "SELECT id, name, prefix, description, created_at FROM projects ORDER BY name"
+            )
+            columns = ["id", "name", "prefix", "description", "created_at"]
+            projects = [
+                dict(zip(columns, row, strict=False)) for row in cursor.fetchall()
+            ]
 
-        return {
-            "projects": projects,
-            "count": len(projects),
-        }
+            return {
+                "projects": projects,
+                "count": len(projects),
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -255,38 +258,37 @@ def list_tasks(
         List of task summaries (NOT full context)
     """
     try:
-        conn = _get_db()
+        with closing(_get_db()) as conn:
+            query = """
+                SELECT t.task_id, t.name, t.status, t.priority, t.type, p.prefix
+                FROM tasks t
+                JOIN projects p ON t.project_id = p.id
+                WHERE 1=1
+            """
+            params: list[Any] = []
 
-        query = """
-            SELECT t.task_id, t.name, t.status, t.priority, t.type, p.prefix
-            FROM tasks t
-            JOIN projects p ON t.project_id = p.id
-            WHERE 1=1
-        """
-        params: list[Any] = []
+            if project:
+                query += " AND p.prefix = ?"
+                params.append(project.upper())
+            if status:
+                query += " AND t.status = ?"
+                params.append(status)
+            if task_type:
+                query += " AND t.type = ?"
+                params.append(task_type)
 
-        if project:
-            query += " AND p.prefix = ?"
-            params.append(project.upper())
-        if status:
-            query += " AND t.status = ?"
-            params.append(status)
-        if task_type:
-            query += " AND t.type = ?"
-            params.append(task_type)
+            query += " ORDER BY t.priority ASC, t.created_at ASC LIMIT ?"
+            params.append(limit)
 
-        query += " ORDER BY t.priority ASC, t.created_at ASC LIMIT ?"
-        params.append(limit)
+            cursor = conn.execute(query, params)
+            columns = ["task_id", "name", "status", "priority", "type", "project"]
+            tasks = [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
 
-        cursor = conn.execute(query, params)
-        columns = ["task_id", "name", "status", "priority", "type", "project"]
-        tasks = [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
-
-        return {
-            "tasks": tasks,
-            "count": len(tasks),
-            "note": "Summaries only. Use get_task(id) for full context.",
-        }
+            return {
+                "tasks": tasks,
+                "count": len(tasks),
+                "note": "Summaries only. Use get_task(id) for full context.",
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -309,30 +311,29 @@ def get_task(task_id: str) -> dict[str, Any]:
         Full task context for implementation
     """
     try:
-        conn = _get_db()
+        with closing(_get_db()) as conn:
+            cursor = conn.execute(
+                """
+                SELECT t.*, p.prefix, p.name as project_name
+                FROM tasks t
+                JOIN projects p ON t.project_id = p.id
+                WHERE t.task_id = ?
+                """,
+                (task_id,),
+            )
 
-        cursor = conn.execute(
-            """
-            SELECT t.*, p.prefix, p.name as project_name
-            FROM tasks t
-            JOIN projects p ON t.project_id = p.id
-            WHERE t.task_id = ?
-            """,
-            (task_id,),
-        )
+            row = cursor.fetchone()
+            if not row:
+                return {"found": False, "error": f"Task '{task_id}' not found"}
 
-        row = cursor.fetchone()
-        if not row:
-            return {"found": False, "error": f"Task '{task_id}' not found"}
+            # Get column names from cursor description
+            columns = [desc[0] for desc in cursor.description]
+            task = _row_to_task(row, columns)
 
-        # Get column names from cursor description
-        columns = [desc[0] for desc in cursor.description]
-        task = _row_to_task(row, columns)
-
-        return {
-            "found": True,
-            "task": task,
-        }
+            return {
+                "found": True,
+                "task": task,
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -356,41 +357,40 @@ def get_next_task(
         Full context for the highest-priority ready task
     """
     try:
-        conn = _get_db()
+        with closing(_get_db()) as conn:
+            query = """
+                SELECT t.*, p.prefix, p.name as project_name
+                FROM tasks t
+                JOIN projects p ON t.project_id = p.id
+                WHERE t.status = 'ready'
+            """
+            params: list[Any] = []
 
-        query = """
-            SELECT t.*, p.prefix, p.name as project_name
-            FROM tasks t
-            JOIN projects p ON t.project_id = p.id
-            WHERE t.status = 'ready'
-        """
-        params: list[Any] = []
+            if project:
+                query += " AND p.prefix = ?"
+                params.append(project.upper())
+            if task_type:
+                query += " AND t.type = ?"
+                params.append(task_type)
 
-        if project:
-            query += " AND p.prefix = ?"
-            params.append(project.upper())
-        if task_type:
-            query += " AND t.type = ?"
-            params.append(task_type)
+            query += " ORDER BY t.priority ASC, t.created_at ASC LIMIT 1"
 
-        query += " ORDER BY t.priority ASC, t.created_at ASC LIMIT 1"
+            cursor = conn.execute(query, params)
+            row = cursor.fetchone()
 
-        cursor = conn.execute(query, params)
-        row = cursor.fetchone()
+            if not row:
+                return {
+                    "found": False,
+                    "message": "No ready tasks found",
+                }
 
-        if not row:
+            columns = [desc[0] for desc in cursor.description]
+            task = _row_to_task(row, columns)
+
             return {
-                "found": False,
-                "message": "No ready tasks found",
+                "found": True,
+                "task": task,
             }
-
-        columns = [desc[0] for desc in cursor.description]
-        task = _row_to_task(row, columns)
-
-        return {
-            "found": True,
-            "task": task,
-        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -437,77 +437,84 @@ def create_task(
         Created task ID and initial status
     """
     try:
-        conn = _get_db()
-        prefix_upper = project.upper()
+        with closing(_get_db()) as conn:
+            prefix_upper = project.upper()
 
-        # Get project ID
-        cursor = conn.execute(
-            "SELECT id FROM projects WHERE prefix = ?",
-            (prefix_upper,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return {"error": f"Project '{prefix_upper}' not found"}
-        project_id = row[0]
-
-        # Generate task ID
-        task_num = _get_next_task_number(conn, project_id, task_type)
-        task_id = f"{prefix_upper}-{task_type.upper()}-{task_num:03d}"
-
-        # Determine initial status
-        initial_status = "backlog"
-        if depends_on:
-            # Check if all dependencies are done
-            placeholders = ",".join("?" * len(depends_on))
+            # Get project ID
             cursor = conn.execute(
-                f"""
-                SELECT COUNT(*) FROM tasks
-                WHERE task_id IN ({placeholders}) AND status != 'done'
-                """,
-                depends_on,
+                "SELECT id FROM projects WHERE prefix = ?",
+                (prefix_upper,),
             )
-            incomplete = cursor.fetchone()[0]
-            if incomplete == 0:
+            row = cursor.fetchone()
+            if not row:
+                return {"error": f"Project '{prefix_upper}' not found"}
+            project_id: int = row[0]
+
+            # Generate task ID
+            task_num = _get_next_task_number(conn, project_id, task_type)
+            task_id = f"{prefix_upper}-{task_type.upper()}-{task_num:03d}"
+
+            # Determine initial status
+            initial_status = "backlog"
+            if depends_on:
+                # Check if all dependencies exist and are done
+                placeholders = ",".join("?" * len(depends_on))
+                cursor = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS found,
+                        SUM(CASE WHEN status != 'done' THEN 1 ELSE 0 END) AS incomplete
+                    FROM tasks
+                    WHERE task_id IN ({placeholders})
+                    """,
+                    depends_on,
+                )
+                row = cursor.fetchone()
+                found: int = row[0] if row else 0
+                incomplete: int = row[1] if row and row[1] is not None else 0
+                if found != len(depends_on):
+                    return {"error": "One or more dependencies not found"}
+                if incomplete == 0:
+                    initial_status = "ready"
+            else:
                 initial_status = "ready"
-        else:
-            initial_status = "ready"
 
-        cursor = conn.execute(
-            """
-            INSERT INTO tasks (
-                project_id, task_id, type, name, status, priority,
-                description, action, files_exclusive, files_readonly,
-                files_forbidden, verify, done_criteria, depends_on,
-                parent_id, execution_strategy, checkpoint_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                project_id,
-                task_id,
-                task_type,
-                name,
-                initial_status,
-                priority,
-                description,
-                action,
-                _json_dumps(files_exclusive),
-                _json_dumps(files_readonly),
-                _json_dumps(files_forbidden),
-                _json_dumps(verify),
-                _json_dumps(done_criteria),
-                _json_dumps(depends_on),
-                parent_id,
-                execution_strategy,
-                checkpoint_type,
-            ),
-        )
-        conn.commit()
+            cursor = conn.execute(
+                """
+                INSERT INTO tasks (
+                    project_id, task_id, type, name, status, priority,
+                    description, action, files_exclusive, files_readonly,
+                    files_forbidden, verify, done_criteria, depends_on,
+                    parent_id, execution_strategy, checkpoint_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    task_id,
+                    task_type,
+                    name,
+                    initial_status,
+                    priority,
+                    description,
+                    action,
+                    _json_dumps(files_exclusive),
+                    _json_dumps(files_readonly),
+                    _json_dumps(files_forbidden),
+                    _json_dumps(verify),
+                    _json_dumps(done_criteria),
+                    _json_dumps(depends_on),
+                    parent_id,
+                    execution_strategy,
+                    checkpoint_type,
+                ),
+            )
+            conn.commit()
 
-        return {
-            "created": True,
-            "id": task_id,
-            "status": initial_status,
-        }
+            return {
+                "created": True,
+                "id": task_id,
+                "status": initial_status,
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -532,41 +539,40 @@ def update_task_status(
         Update confirmation
     """
     try:
-        conn = _get_db()
+        with closing(_get_db()) as conn:
+            now = datetime.now().isoformat()
 
-        now = datetime.now().isoformat()
+            if status == "blocked":
+                cursor = conn.execute(
+                    """
+                    UPDATE tasks SET
+                        status = ?, blocker_reason = ?, blocker_needs = ?,
+                        updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (status, blocker_reason, blocker_needs, now, task_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE tasks SET
+                        status = ?, blocker_reason = NULL, blocker_needs = NULL,
+                        updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (status, now, task_id),
+                )
 
-        if status == "blocked":
-            cursor = conn.execute(
-                """
-                UPDATE tasks SET
-                    status = ?, blocker_reason = ?, blocker_needs = ?,
-                    updated_at = ?
-                WHERE task_id = ?
-                """,
-                (status, blocker_reason, blocker_needs, now, task_id),
-            )
-        else:
-            cursor = conn.execute(
-                """
-                UPDATE tasks SET
-                    status = ?, blocker_reason = NULL, blocker_needs = NULL,
-                    updated_at = ?
-                WHERE task_id = ?
-                """,
-                (status, now, task_id),
-            )
+            if cursor.rowcount == 0:
+                return {"updated": False, "error": f"Task '{task_id}' not found"}
 
-        if cursor.rowcount == 0:
-            return {"updated": False, "error": f"Task '{task_id}' not found"}
+            conn.commit()
 
-        conn.commit()
-
-        return {
-            "updated": True,
-            "id": task_id,
-            "status": status,
-        }
+            return {
+                "updated": True,
+                "id": task_id,
+                "status": status,
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -589,63 +595,67 @@ def complete_task(
         Completion status and list of unblocked tasks
     """
     try:
-        conn = _get_db()
-        now = datetime.now().isoformat()
+        with closing(_get_db()) as conn:
+            now = datetime.now().isoformat()
 
-        # Update the task
-        conn.execute(
-            """
-            UPDATE tasks SET
-                status = 'done', summary = ?, commits = ?, updated_at = ?
-            WHERE task_id = ?
-            """,
-            (summary, _json_dumps(commits), now, task_id),
-        )
+            # Update the task
+            cursor = conn.execute(
+                """
+                UPDATE tasks SET
+                    status = 'done', summary = ?, commits = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (summary, _json_dumps(commits), now, task_id),
+            )
 
-        # Find and unblock dependent tasks
-        cursor = conn.execute(
-            """
-            SELECT task_id, depends_on FROM tasks
-            WHERE depends_on LIKE ? AND status = 'backlog'
-            """,
-            (f'%"{task_id}"%',),
-        )
+            if cursor.rowcount == 0:
+                return {"completed": False, "error": f"Task '{task_id}' not found"}
 
-        unblocked = []
-        for row in cursor.fetchall():
-            dep_task_id, depends_on_json = row
-            depends_on = _json_loads(depends_on_json) or []
+            # Find and unblock dependent tasks
+            cursor = conn.execute(
+                """
+                SELECT task_id, depends_on FROM tasks
+                WHERE depends_on LIKE ? AND status = 'backlog'
+                """,
+                (f'%"{task_id}"%',),
+            )
 
-            if task_id in depends_on:
-                # Check if all dependencies are now done
-                remaining = [d for d in depends_on if d != task_id]
-                if remaining:
-                    placeholders = ",".join("?" * len(remaining))
-                    check = conn.execute(
-                        f"""
-                        SELECT COUNT(*) FROM tasks
-                        WHERE task_id IN ({placeholders}) AND status != 'done'
-                        """,
-                        remaining,
-                    )
-                    incomplete = check.fetchone()[0]
-                else:
-                    incomplete = 0
+            unblocked: list[str] = []
+            for row in cursor.fetchall():
+                dep_task_id, depends_on_json = row
+                deps = _json_loads(depends_on_json) or []
 
-                if incomplete == 0:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready', updated_at = ? WHERE task_id = ?",
-                        (now, dep_task_id),
-                    )
-                    unblocked.append(dep_task_id)
+                if task_id in deps:
+                    # Check if all dependencies are now done
+                    remaining = [d for d in deps if d != task_id]
+                    if remaining:
+                        placeholders = ",".join("?" * len(remaining))
+                        check = conn.execute(
+                            f"""
+                            SELECT COUNT(*) FROM tasks
+                            WHERE task_id IN ({placeholders}) AND status != 'done'
+                            """,
+                            remaining,
+                        )
+                        check_row = check.fetchone()
+                        incomplete: int = check_row[0] if check_row else 0
+                    else:
+                        incomplete = 0
 
-        conn.commit()
+                    if incomplete == 0:
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready', updated_at = ? WHERE task_id = ?",
+                            (now, dep_task_id),
+                        )
+                        unblocked.append(dep_task_id)
 
-        return {
-            "completed": True,
-            "id": task_id,
-            "unblocked": unblocked,
-        }
+            conn.commit()
+
+            return {
+                "completed": True,
+                "id": task_id,
+                "unblocked": unblocked,
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -662,17 +672,17 @@ def delete_task(task_id: str) -> dict[str, Any]:
         Deletion confirmation
     """
     try:
-        conn = _get_db()
-        cursor = conn.execute(
-            "DELETE FROM tasks WHERE task_id = ?",
-            (task_id,),
-        )
-        conn.commit()
+        with closing(_get_db()) as conn:
+            cursor = conn.execute(
+                "DELETE FROM tasks WHERE task_id = ?",
+                (task_id,),
+            )
+            conn.commit()
 
-        if cursor.rowcount == 0:
-            return {"deleted": False, "error": f"Task '{task_id}' not found"}
+            if cursor.rowcount == 0:
+                return {"deleted": False, "error": f"Task '{task_id}' not found"}
 
-        return {"deleted": True, "id": task_id}
+            return {"deleted": True, "id": task_id}
     except Exception as e:
         return {"error": str(e)}
 
@@ -696,79 +706,78 @@ def get_backlog_summary(project: str | None = None) -> dict[str, Any]:
         Summary with counts and highlighted items
     """
     try:
-        conn = _get_db()
+        with closing(_get_db()) as conn:
+            # Build base query conditions
+            base_condition = ""
+            params: list[Any] = []
+            if project:
+                base_condition = "WHERE p.prefix = ?"
+                params = [project.upper()]
 
-        # Build base query conditions
-        base_condition = ""
-        params: list[Any] = []
-        if project:
-            base_condition = "WHERE p.prefix = ?"
-            params = [project.upper()]
+            # Count by status
+            cursor = conn.execute(
+                f"""
+                SELECT t.status, COUNT(*) FROM tasks t
+                JOIN projects p ON t.project_id = p.id
+                {base_condition}
+                GROUP BY t.status
+                """,
+                params,
+            )
+            by_status = dict(cursor.fetchall())
 
-        # Count by status
-        cursor = conn.execute(
-            f"""
-            SELECT t.status, COUNT(*) FROM tasks t
-            JOIN projects p ON t.project_id = p.id
-            {base_condition}
-            GROUP BY t.status
-            """,
-            params,
-        )
-        by_status = dict(cursor.fetchall())
+            # Count by type
+            cursor = conn.execute(
+                f"""
+                SELECT t.type, COUNT(*) FROM tasks t
+                JOIN projects p ON t.project_id = p.id
+                {base_condition}
+                GROUP BY t.type
+                """,
+                params,
+            )
+            by_type = dict(cursor.fetchall())
 
-        # Count by type
-        cursor = conn.execute(
-            f"""
-            SELECT t.type, COUNT(*) FROM tasks t
-            JOIN projects p ON t.project_id = p.id
-            {base_condition}
-            GROUP BY t.type
-            """,
-            params,
-        )
-        by_type = dict(cursor.fetchall())
+            # Get in-progress tasks
+            cursor = conn.execute(
+                f"""
+                SELECT t.task_id, t.name, t.priority FROM tasks t
+                JOIN projects p ON t.project_id = p.id
+                WHERE t.status = 'in_progress'
+                {"AND p.prefix = ?" if project else ""}
+                ORDER BY t.priority ASC
+                """,
+                params,
+            )
+            in_progress = [
+                {"task_id": row[0], "name": row[1], "priority": row[2]}
+                for row in cursor.fetchall()
+            ]
 
-        # Get in-progress tasks
-        cursor = conn.execute(
-            f"""
-            SELECT t.task_id, t.name, t.priority FROM tasks t
-            JOIN projects p ON t.project_id = p.id
-            WHERE t.status = 'in_progress'
-            {"AND p.prefix = ?" if project else ""}
-            ORDER BY t.priority ASC
-            """,
-            params,
-        )
-        in_progress = [
-            {"task_id": row[0], "name": row[1], "priority": row[2]}
-            for row in cursor.fetchall()
-        ]
+            # Get blocked tasks
+            cursor = conn.execute(
+                f"""
+                SELECT t.task_id, t.name, t.blocker_reason FROM tasks t
+                JOIN projects p ON t.project_id = p.id
+                WHERE t.status = 'blocked'
+                {"AND p.prefix = ?" if project else ""}
+                """,
+                params,
+            )
+            blocked = [
+                {"task_id": row[0], "name": row[1], "reason": row[2]}
+                for row in cursor.fetchall()
+            ]
 
-        # Get blocked tasks
-        cursor = conn.execute(
-            f"""
-            SELECT t.task_id, t.name, t.blocker_reason FROM tasks t
-            JOIN projects p ON t.project_id = p.id
-            WHERE t.status = 'blocked'
-            {"AND p.prefix = ?" if project else ""}
-            """,
-            params,
-        )
-        blocked = [
-            {"task_id": row[0], "name": row[1], "reason": row[2]}
-            for row in cursor.fetchall()
-        ]
-
-        return {
-            "summary": {
-                "by_status": by_status,
-                "by_type": by_type,
-                "in_progress": in_progress,
-                "blocked": blocked,
-                "total": sum(by_status.values()),
-            },
-        }
+            return {
+                "summary": {
+                    "by_status": by_status,
+                    "by_type": by_type,
+                    "in_progress": in_progress,
+                    "blocked": blocked,
+                    "total": sum(by_status.values()),
+                },
+            }
     except Exception as e:
         return {"error": str(e)}
 
