@@ -7,12 +7,14 @@ license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.0.0",
+    "libsql-experimental>=0.0.50,<0.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "ruff>=0.8.0",
-    "mypy>=1.14.0",
+    "pyright>=1.1.0",
+    "pytest>=9.0.2",
 ]
 
 [project.scripts]
@@ -44,6 +46,8 @@ select = [
     "UP",     # pyupgrade
     "ARG",    # flake8-unused-arguments
     "SIM",    # flake8-simplify
+    "G",      # flake8-logging-format
+    "LOG",    # flake8-logging
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
@@ -52,15 +56,18 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = ["backlog_mcp"]
 
-[tool.mypy]
-python_version = "3.10"
-strict = true
-warn_return_any = true
-warn_unused_ignores = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-check_untyped_defs = true
-disallow_any_generics = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_configs = true
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+# Strict checks for None handling
+reportOptionalMemberAccess = "error"
+reportOptionalCall = "error"
+reportOptionalIterable = "error"
+reportOptionalContextManager = "error"
+reportOptionalOperand = "error"
+reportOptionalSubscript = "error"
+# Catch possibly unbound variables
+reportPossiblyUnboundVariable = "error"
+reportUnusedImport = "error"
+reportUnusedVariable = "warning"
