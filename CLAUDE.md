@@ -9,6 +9,8 @@ Single-task loading MCP server for Claude Code - prevents scope creep by exposin
 | `src/backlog_mcp/server.py` | Main MCP server with all tools |
 | `src/backlog_mcp/__init__.py` | Package exports |
 | `pyproject.toml` | Dependencies and build config |
+| `plans/` | Implementation plans and proposals |
+| `docs/` | Extended documentation (architecture, patterns) |
 
 ## Prerequisites
 
@@ -33,7 +35,7 @@ uv run ruff check .
 uv run ruff format .
 
 # Type check
-uv run mypy src/
+uv run pyright src/ tests/
 
 # Run tests
 uv run pytest tests/ -v
