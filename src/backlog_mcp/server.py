@@ -26,9 +26,10 @@ from typing import Any
 import libsql_experimental as libsql  # type: ignore[import-untyped]
 from mcp.server.fastmcp import FastMCP
 
-# Valid values for task_type and status
+# Valid values for task_type, status, and model
 VALID_TASK_TYPES = frozenset({"task", "bug", "spike", "epic"})
 VALID_STATUSES = frozenset({"backlog", "ready", "in_progress", "blocked", "done"})
+VALID_MODELS = frozenset({"haiku", "sonnet", "opus"})
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -89,6 +90,8 @@ def _init_schema(conn: libsql.Connection) -> None:
             parent_id TEXT,
             execution_strategy TEXT,
             checkpoint_type TEXT,
+            suggested_model TEXT,
+            resolved_by_episode TEXT,
             blocker_reason TEXT,
             blocker_needs TEXT,
             summary TEXT,
@@ -428,6 +431,7 @@ def create_task(
     parent_id: str | None = None,
     execution_strategy: str | None = None,
     checkpoint_type: str | None = None,
+    suggested_model: str | None = None,
 ) -> dict[str, Any]:
     """
     Create a new task in the backlog.
@@ -448,6 +452,7 @@ def create_task(
         parent_id: Parent epic ID (for tasks under epics)
         execution_strategy: A (auto), B (human-verify), C (decision)
         checkpoint_type: auto, human-verify, decision
+        suggested_model: Recommended model (haiku, sonnet, opus) based on task complexity
 
     Returns:
         Created task ID and initial status
@@ -458,6 +463,14 @@ def create_task(
         return {
             "error": f"Invalid task_type '{task_type}'. "
             f"Must be one of: {', '.join(sorted(VALID_TASK_TYPES))}"
+        }
+
+    # Validate suggested_model if provided
+    model_lower = suggested_model.lower() if suggested_model else None
+    if model_lower and model_lower not in VALID_MODELS:
+        return {
+            "error": f"Invalid suggested_model '{suggested_model}'. "
+            f"Must be one of: {', '.join(sorted(VALID_MODELS))}"
         }
 
     try:
@@ -512,8 +525,8 @@ def create_task(
                             project_id, task_id, type, name, status, priority,
                             description, action, files_exclusive, files_readonly,
                             files_forbidden, verify, done_criteria, depends_on,
-                            parent_id, execution_strategy, checkpoint_type
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            parent_id, execution_strategy, checkpoint_type, suggested_model
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             project_id,
@@ -533,6 +546,7 @@ def create_task(
                             parent_id,
                             execution_strategy,
                             checkpoint_type,
+                            model_lower,
                         ),
                     )
                     conn.commit()
@@ -541,6 +555,7 @@ def create_task(
                         "created": True,
                         "id": task_id,
                         "status": initial_status,
+                        "suggested_model": model_lower,
                     }
                 except libsql.IntegrityError:
                     # Task ID collision from race condition, retry
@@ -625,6 +640,7 @@ def complete_task(
     task_id: str,
     summary: str | None = None,
     commits: list[str] | None = None,
+    resolved_by_episode: str | None = None,
 ) -> dict[str, Any]:
     """
     Mark task as done and unblock dependent tasks.
@@ -633,6 +649,7 @@ def complete_task(
         task_id: Task ID to complete
         summary: Brief summary of what was done
         commits: List of commit hashes/messages
+        resolved_by_episode: Episode ID from reflection-mcp that helped resolve this task
 
     Returns:
         Completion status and list of unblocked tasks
@@ -645,10 +662,11 @@ def complete_task(
             cursor = conn.execute(
                 """
                 UPDATE tasks SET
-                    status = 'done', summary = ?, commits = ?, updated_at = ?
+                    status = 'done', summary = ?, commits = ?,
+                    resolved_by_episode = ?, updated_at = ?
                 WHERE task_id = ?
                 """,
-                (summary, _json_dumps(commits), now, task_id),
+                (summary, _json_dumps(commits), resolved_by_episode, now, task_id),
             )
 
             if cursor.rowcount == 0:
@@ -697,6 +715,7 @@ def complete_task(
             return {
                 "completed": True,
                 "id": task_id,
+                "resolved_by_episode": resolved_by_episode,
                 "unblocked": unblocked,
             }
     except Exception as e:
