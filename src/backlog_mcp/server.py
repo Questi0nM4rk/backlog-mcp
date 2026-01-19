@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import libsql_experimental as libsql  # type: ignore[import-untyped]
+import libsql_experimental as libsql  # type: ignore[import-untyped]  # pyright: ignore[reportMissingModuleSource]
 from mcp.server.fastmcp import FastMCP
 
 # Valid values for task_type, status, and model
@@ -51,15 +51,15 @@ This prevents scope creep and ensures focused implementation.""",
 )
 
 
-def _get_db() -> libsql.Connection:
+def _get_db() -> "libsql.Connection":  # pyright: ignore[reportAttributeAccessIssue]
     """Get database connection, creating schema if needed."""
     CODEAGENT_DIR.mkdir(parents=True, exist_ok=True)
-    conn = libsql.connect(str(DB_PATH))
+    conn = libsql.connect(str(DB_PATH))  # pyright: ignore[reportAttributeAccessIssue]
     _init_schema(conn)
     return conn
 
 
-def _init_schema(conn: libsql.Connection) -> None:
+def _init_schema(conn: "libsql.Connection") -> None:  # pyright: ignore[reportAttributeAccessIssue]
     """Initialize database schema."""
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript("""
@@ -150,7 +150,9 @@ def _row_to_task(row: tuple[Any, ...], columns: list[str]) -> dict[str, Any]:
 
 
 def _get_next_task_number(
-    conn: libsql.Connection, project_id: int, task_type: str
+    conn: "libsql.Connection",  # pyright: ignore[reportAttributeAccessIssue]
+    project_id: int,
+    task_type: str,
 ) -> int:
     """Get the next task number for a project/type combo.
 
@@ -217,7 +219,7 @@ def create_project(
                 "id": cursor.lastrowid,
                 "prefix": prefix_upper,
             }
-    except libsql.IntegrityError:
+    except libsql.IntegrityError:  # pyright: ignore[reportAttributeAccessIssue]
         return {"error": f"Project with prefix '{prefix}' already exists"}
     except Exception as e:
         return {"error": str(e)}
@@ -557,7 +559,7 @@ def create_task(
                         "status": initial_status,
                         "suggested_model": model_lower,
                     }
-                except libsql.IntegrityError:
+                except libsql.IntegrityError:  # pyright: ignore[reportAttributeAccessIssue]
                     # Task ID collision from race condition, retry
                     if attempt == max_attempts - 1:
                         raise

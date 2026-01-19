@@ -60,6 +60,8 @@ known-first-party = ["backlog_mcp"]
 include = ["src"]
 pythonVersion = "3.10"
 typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
 # Strict checks for None handling
 reportOptionalMemberAccess = "error"
 reportOptionalCall = "error"
