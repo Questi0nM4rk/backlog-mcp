@@ -105,7 +105,7 @@ uv run ruff check src/ tests/
 uv run ruff format src/ tests/
 
 # Type check
-uv run mypy src/ tests/
+uv run pyright src/ tests/
 
 # Run tests
 uv run pytest tests/ -v
